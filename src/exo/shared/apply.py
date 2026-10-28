@@ -344,6 +344,9 @@ def apply_node_timed_out(event: NodeTimedOut, state: State) -> State:
     last_seen = {
         key: value for key, value in state.last_seen.items() if key != event.node_id
     }
+    node_timeouts = dict(state.node_timeouts)
+    if seen := state.last_seen.get(event.node_id):
+        node_timeouts[event.node_id] = seen
     downloads = {
         key: value for key, value in state.downloads.items() if key != event.node_id
     }
@@ -393,6 +396,7 @@ def apply_node_timed_out(event: NodeTimedOut, state: State) -> State:
             "downloads": downloads,
             "topology": topology,
             "last_seen": last_seen,
+            "node_timeouts": node_timeouts,
             "node_memory": node_memory,
             "node_disk": node_disk,
             "node_system": node_system,
@@ -410,14 +414,20 @@ def apply_node_gathered_info(event: NodeGatheredInfo, state: State) -> State:
     topology = copy.deepcopy(state.topology)
     topology.add_node(event.node_id)
     info = event.info
+    reported_at = datetime.fromisoformat(event.when)
 
     # Build update dict with only the mappings that change
     update: dict[str, object] = {
         "last_seen": {
             **state.last_seen,
-            event.node_id: datetime.fromisoformat(event.when),
+            event.node_id: reported_at,
         },
         "topology": topology,
+        "node_timeouts": {
+            node_id: seen
+            for node_id, seen in state.node_timeouts.items()
+            if node_id != event.node_id or reported_at <= seen
+        },
     }
 
     match info:

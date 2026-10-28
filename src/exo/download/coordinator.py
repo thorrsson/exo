@@ -169,6 +169,11 @@ class DownloadCoordinator:
         self._tg.cancel_tasks()
         await self._stopped.wait()
 
+    async def announce_to_master(self) -> None:
+        """Repair the new master's view without cancelling active downloads."""
+        for status in list(self.download_status.values()):
+            await self.event_sender.send(NodeDownloadProgress(download_progress=status))
+
     async def _command_processor(self) -> None:
         with self.download_command_receiver as commands:
             async for cmd in commands:

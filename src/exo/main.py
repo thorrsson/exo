@@ -7,6 +7,7 @@ import signal
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from functools import partial
 from typing import Self
 
@@ -27,6 +28,7 @@ from exo.download.impl_shard_downloader import exo_shard_downloader
 from exo.master.main import Master
 from exo.routing.event_router import EventRouter
 from exo.routing.router import Router, get_node_zid
+from exo.shared.cluster_health import ClusterHealth, cluster_health
 from exo.shared.constants import (
     EXO_DEFAULT_MODELS_DIR,
     EXO_EVENT_LOG_DIR,
@@ -192,8 +194,10 @@ class Node:
             if self.master:
                 tg.start_soon(self.master.run)
             if self.api:
+                self.api.cluster_health_provider = self.cluster_health
                 tg.start_soon(self.api.run)
             tg.start_soon(self._elect_loop)
+            tg.start_soon(self._monitor_cluster_health)
 
     def shutdown(self):
         # if this is our second call to shutdown, just sys.exit
@@ -210,6 +214,40 @@ class Node:
         if self.api:
             return self.api.state
         return None
+
+    def cluster_health(self) -> ClusterHealth:
+        return cluster_health(
+            self.api.state if self.api else self._cluster_state() or State(),
+            self.election.current_session,
+            now=datetime.now(timezone.utc),
+            monotonic_now=anyio.current_time(),
+            campaign_running=self.election.campaign_running,
+            awaiting_snapshot=self.event_router.awaiting_snapshot
+            or self.event_router.session_id != self.election.current_session
+            or bool(self.api and self.api.awaiting_snapshot),
+            master_silence_seconds=self.election.master_silence_seconds,
+            master_confirmed=self.election.master_confirmed,
+            last_delivery_at=self.event_router.last_delivery_at,
+            missing_event_idx=self.event_router.missing_event_idx,
+            conflicting_masters=self.election.conflicting_masters,
+            node_last_seen=self.event_router.node_last_seen,
+            retry_in_seconds=self.election.retry_in_seconds,
+        )
+
+    async def _monitor_cluster_health(self) -> None:
+        previous_status: str | None = None
+        last_warning = -float("inf")
+        while True:
+            health = self.cluster_health()
+            now = anyio.current_time()
+            if health.status == "healthy":
+                if previous_status is not None and previous_status != "healthy":
+                    logger.info(f"Cluster health recovered: {health.model_dump_json()}")
+            elif now - last_warning >= 30.0:
+                logger.warning(f"Cluster health: {health.model_dump_json()}")
+                last_warning = now
+            previous_status = health.status
+            await anyio.sleep(5)
 
     async def _elect_loop(self):
         with self.election_result_receiver as results:
@@ -247,6 +285,8 @@ class Node:
                     if self.worker:
                         # Before anything from the new master can reach the worker
                         self.worker.follow_new_master(result.session_id)
+                    if self.api:
+                        self.api.follow_new_master(result.won_clock)
 
                 if (
                     result.session_id.master_node_id == self.node_id
@@ -281,21 +321,9 @@ class Node:
                     )
                 if result.is_new_master:
                     if self.download_coordinator:
-                        await self.download_coordinator.shutdown()
-                        self.download_coordinator = DownloadCoordinator(
-                            self.node_id,
-                            exo_shard_downloader(offline=self.offline),
-                            event_sender=self.event_router.sender(),
-                            download_command_receiver=self.router.receiver(
-                                topics.DOWNLOAD_COMMANDS
-                            ),
-                            offline=self.offline,
-                        )
-                        self._tg.start_soon(self.download_coordinator.run)
+                        await self.download_coordinator.announce_to_master()
                     if self.worker:
                         await self.worker.announce_to_master()
-                    if self.api:
-                        self.api.follow_new_master(result.won_clock)
                 else:
                     if self.api:
                         self.api.unpause(result.won_clock)

@@ -3,19 +3,31 @@
 from typing import cast
 
 import anyio
+import pytest
 
+from exo.api.main import API
+from exo.download.tests.test_download_status_not_lost import (
+    MODEL_ID,
+    NODE_ID,
+    SHARD,
+    FakeShardDownloader,
+    _setup_coordinator,  # pyright: ignore[reportPrivateUsage]
+)
 from exo.main import Node
 from exo.master.main import Master
 from exo.routing.event_router import EventRouter
 from exo.routing.router import Router, get_node_zid
 from exo.shared.election import Election, ElectionResult
 from exo.shared.types.commands import ForwarderCommand, ForwarderDownloadCommand
-from exo.shared.types.common import NodeId, SessionId
+from exo.shared.types.common import NodeId, SessionId, SystemId
 from exo.shared.types.events import (
     GlobalForwarderEvent,
     LocalForwarderEvent,
+    NodeDownloadProgress,
     StateSnapshot,
 )
+from exo.shared.types.state import State
+from exo.shared.types.worker.downloads import DownloadPending
 from exo.utils.channels import channel
 
 
@@ -28,7 +40,9 @@ class RecordingEventRouter(EventRouter):
         super().switch_session(session_id)
 
 
-async def test_a_demoted_master_stops_before_the_node_switches_session() -> None:
+async def test_a_demoted_master_stops_before_the_node_switches_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     # Catches the old master still producing events (which the event router would tag
     # with the new master's session) once the node has switched to the new session
     node_id = get_node_zid()
@@ -54,15 +68,40 @@ async def test_a_demoted_master_stops_before_the_node_switches_session() -> None
         download_command_sender=channel[ForwarderDownloadCommand]()[0],
     )
     result_send, result_recv = channel[ElectionResult]()
+    coordinator, _commands, download_events = _setup_coordinator(FakeShardDownloader())
+    active_download = anyio.CancelScope()
+    coordinator.active_downloads[MODEL_ID] = active_download
+    status = DownloadPending(node_id=NODE_ID, shard_metadata=SHARD)
+    coordinator.download_status[MODEL_ID] = status
+    api = object.__new__(API)
+    api.state = State()
+    api.awaiting_snapshot = False
+    api.paused_ev = anyio.Event()
+    api._text_generation_queues = {}  # pyright: ignore[reportPrivateUsage]
+    api._image_generation_queues = {}  # pyright: ignore[reportPrivateUsage]
+    snapshot_applied = anyio.Event()
+    announce = coordinator.announce_to_master
+
+    async def announce_and_receive_snapshot() -> None:
+        await announce()
+        # A fast new master can reply during the first awaited announcement.
+        api._apply_snapshot(  # pyright: ignore[reportPrivateUsage]
+            StateSnapshot(session=new_session, requester=SystemId(), state=State())
+        )
+        snapshot_applied.set()
+
+    monkeypatch.setattr(
+        coordinator, "announce_to_master", announce_and_receive_snapshot
+    )
     node = Node(
         router=cast(Router, object()),
         event_router=event_router,
-        download_coordinator=None,
+        download_coordinator=coordinator,
         worker=None,
         election=cast(Election, object()),
         election_result_receiver=result_recv,
         master=master,
-        api=None,
+        api=api,
         node_id=node_id,
         offline=False,
         _api_port=0,
@@ -82,11 +121,18 @@ async def test_a_demoted_master_stops_before_the_node_switches_session() -> None
             ElectionResult(session_id=new_session, won_clock=2, is_new_master=True)
         )
         with anyio.fail_after(5):
-            while not event_router.master_running_at_switch:
-                await anyio.sleep(0.01)
+            await snapshot_applied.wait()
 
         assert event_router.master_running_at_switch == [False]
         assert node.master is None
         assert event_router.session_id == new_session
+        assert node.download_coordinator is coordinator
+        assert not active_download.cancel_called
+        assert coordinator.active_downloads[MODEL_ID] is active_download
+        assert not api.awaiting_snapshot
+        announced = download_events.collect()
+        assert len(announced) == 1
+        assert isinstance(announced[0], NodeDownloadProgress)
+        assert announced[0].download_progress == status
         result_send.close()
         tg.cancel_scope.cancel()

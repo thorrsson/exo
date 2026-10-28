@@ -70,6 +70,16 @@ export interface TopologyData {
   edges: TopologyEdge[];
 }
 
+export interface ClusterHealth {
+  status: "healthy" | "degraded" | "recovering";
+  issues: string[];
+  unavailableNodeIds: string[];
+  masterSilenceSeconds: number | null;
+  stateSilenceSeconds: number | null;
+  retryInSeconds: number;
+  missingEventIdx: number | null;
+}
+
 export interface Instance {
   shardAssignments?: {
     modelId?: string;
@@ -607,6 +617,8 @@ class AppStore {
 
   /** True when the backend is reachable. */
   isConnected = $state<boolean>(true);
+  clusterHealth = $state<ClusterHealth | null>(null);
+  private fetchingState = false;
   /** Number of consecutive fetch failures. */
   private consecutiveFailures = 0;
   private static readonly CONNECTION_LOST_THRESHOLD = 3;
@@ -1310,12 +1322,19 @@ class AppStore {
   }
 
   async fetchState() {
+    if (this.fetchingState) return;
+    this.fetchingState = true;
     try {
-      const response = await fetch("/state");
+      const signal = AbortSignal.timeout(5000);
+      const [response, healthResponse] = await Promise.all([
+        fetch("/state", { signal }),
+        this.fetchClusterHealth(signal),
+      ]);
       if (!response.ok) {
         throw new Error(`Failed to fetch state: ${response.status}`);
       }
       const data: RawStateResponse = await response.json();
+      this.clusterHealth = healthResponse;
 
       if (data.topology) {
         this.topologyData = transformTopology(data.topology, {
@@ -1362,6 +1381,7 @@ class AppStore {
       }
       this.consecutiveFailures = 0;
     } catch (error) {
+      this.clusterHealth = null;
       this.consecutiveFailures++;
       if (
         this.consecutiveFailures >= AppStore.CONNECTION_LOST_THRESHOLD &&
@@ -1370,6 +1390,23 @@ class AppStore {
         this.isConnected = false;
       }
       console.error("Error fetching state:", error);
+    } finally {
+      this.fetchingState = false;
+    }
+  }
+
+  private async fetchClusterHealth(
+    signal: AbortSignal,
+  ): Promise<ClusterHealth | null> {
+    try {
+      const response = await fetch("/cluster/health", { signal });
+      if (!response.ok) {
+        throw new Error(`Failed to fetch cluster health: ${response.status}`);
+      }
+      return await response.json();
+    } catch (error) {
+      console.error("Error fetching cluster health:", error);
+      return null;
     }
   }
 
@@ -3609,6 +3646,7 @@ export const refreshState = () => appStore.fetchState();
 
 // Connection status
 export const isConnected = () => appStore.isConnected;
+export const getClusterHealth = () => appStore.clusterHealth;
 
 // Node identities (for OS version mismatch detection)
 export const nodeIdentities = () => appStore.nodeIdentities;

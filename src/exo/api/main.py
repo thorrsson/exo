@@ -7,7 +7,7 @@ import random
 import shutil
 import socket
 import time
-from collections.abc import AsyncGenerator, Iterable
+from collections.abc import AsyncGenerator, Callable, Iterable
 from datetime import datetime, timezone
 from functools import partial
 from http import HTTPStatus
@@ -141,6 +141,7 @@ from exo.master.image_store import ImageStore
 from exo.master.placement import place_instance as get_instance_placements
 from exo.routing.event_router import NodeEventReceiver
 from exo.shared.apply import apply
+from exo.shared.cluster_health import ClusterHealth
 from exo.shared.constants import (
     ENABLE_DISAGGREGATION,
     EXO_CACHE_HOME,
@@ -283,6 +284,8 @@ class API:
         election_receiver: Receiver[ElectionMessage],
     ) -> None:
         self.state = State()
+        self.cluster_health_provider: Callable[[], ClusterHealth] | None = None
+        self.awaiting_snapshot = False
         self._recent_events = RecentEvents()
         self._system_id = SystemId()
         self.command_sender = command_sender
@@ -348,6 +351,7 @@ class API:
         its snapshot replaces it, so the running models stay usable, but end the requests
         in flight, whose output the old master was routing."""
         logger.info("Following a new master")
+        self.awaiting_snapshot = True
         self._system_id = SystemId()
         self._shutdown_queues(self._text_generation_queues)
         self._shutdown_queues(self._image_generation_queues)
@@ -441,6 +445,7 @@ class API:
         self.app.get("/ollama/api/version")(self.ollama_version)
 
         self.app.get("/state")(self.get_state)
+        self.app.get("/cluster/health")(self.get_cluster_health)
         self.app.get("/state/{path:path}")(self.get_state)
         self.app.get("/events")(self.get_events)
         self.app.post("/download/start")(self.start_download)
@@ -453,6 +458,13 @@ class API:
         self.app.get("/v1/traces/{task_id}/raw")(self.get_trace_raw)
         self.app.get("/onboarding")(self.get_onboarding)
         self.app.post("/onboarding")(self.complete_onboarding)
+
+    async def get_cluster_health(self) -> ClusterHealth:
+        if self.cluster_health_provider is None:
+            return ClusterHealth(
+                status="recovering", issues=["Cluster health monitor is not ready"]
+            )
+        return self.cluster_health_provider()
 
     def get_state(self, path: str = ""):
         if path == "":
@@ -2078,6 +2090,7 @@ class API:
 
     def _apply_snapshot(self, snapshot: StateSnapshot) -> None:
         self.state = snapshot.state
+        self.awaiting_snapshot = False
         # Output for in-flight requests may have been in the events we skipped
         in_flight = [
             *self._text_generation_queues.values(),
