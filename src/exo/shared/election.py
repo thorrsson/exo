@@ -133,12 +133,35 @@ class Election:
         # When a heartbeat or a silent master may next start an election, and the gap after that
         self._retry_at = -math.inf
         self._retry_delay = RETRY_MIN_DELAY
+        self.conflicting_masters: dict[NodeId, float] = {}
+        self._master_heartbeat_received = False
 
         # Campaign state
         self._candidates: list[ElectionMessage] = []
         self._campaign_cancel_scope: CancelScope | None = None
         self._campaign_done: Event | None = None
         self._tg = TaskGroup()
+
+    @property
+    def campaign_running(self) -> bool:
+        return self._campaign_cancel_scope is not None
+
+    @property
+    def master_silence_seconds(self) -> float | None:
+        if self.current_session.master_node_id == self.node_id:
+            return None
+        return max(0.0, anyio.current_time() - self._master_last_heard)
+
+    @property
+    def master_confirmed(self) -> bool:
+        return (
+            self.current_session.master_node_id == self.node_id
+            or self._master_heartbeat_received
+        )
+
+    @property
+    def retry_in_seconds(self) -> float:
+        return max(0.0, self._retry_at - anyio.current_time())
 
     async def run(self):
         logger.info("Starting Election")
@@ -170,7 +193,9 @@ class Election:
         logger.debug(f"Electing: {em}")
         is_new_master = em.proposed_session != self.current_session
         self.current_session = em.proposed_session
-        self._master_last_heard = anyio.current_time()
+        if is_new_master:
+            self._master_last_heard = anyio.current_time()
+            self._master_heartbeat_received = False
         logger.debug(f"Current session: {self.current_session}")
         await self._er_sender.send(
             ElectionResult(
@@ -199,7 +224,6 @@ class Election:
                     f"No heartbeat from master {self.current_session.master_node_id} "
                     f"for {silence:.0f}s; starting a new election"
                 )
-                self._master_last_heard = anyio.current_time()
                 self.clock += 1
                 candidates: list[ElectionMessage] = []
                 self._candidates = candidates
@@ -213,7 +237,17 @@ class Election:
             self.clock = max(self.clock, message.clock)
             self._master_last_heard = anyio.current_time()
             self._master_status = message
+            self._master_heartbeat_received = True
+            self.conflicting_masters.pop(message.proposed_session.master_node_id, None)
             return
+        if (
+            message.proposed_session.master_node_id
+            == self.current_session.master_node_id
+        ):
+            self._master_heartbeat_received = False
+        self.conflicting_masters[message.proposed_session.master_node_id] = (
+            anyio.current_time()
+        )
         if self._campaign_cancel_scope is not None:
             # A round is already running and will settle who is master
             return

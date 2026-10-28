@@ -7,13 +7,14 @@ from anyio.abc import CancelScope
 from loguru import logger
 
 from exo.shared.types.commands import ForwarderCommand, RequestEventLog
-from exo.shared.types.common import SessionId, SystemId
+from exo.shared.types.common import NodeId, SessionId, SystemId
 from exo.shared.types.events import (
     Event,
     EventId,
     GlobalForwarderEvent,
     IndexedEvent,
     LocalForwarderEvent,
+    NodeGatheredInfo,
     StateSnapshot,
 )
 from exo.utils import channels
@@ -72,6 +73,13 @@ class EventRouter:
     _nack_attempts: int = field(init=False, default=0)
     _nack_base_seconds: float = field(init=False, default=0.5)
     _nack_cap_seconds: float = field(init=False, default=10.0)
+    missing_event_idx: int | None = field(init=False, default=None)
+    last_delivery_at: float | None = field(init=False, default=None)
+    node_last_seen: dict[NodeId, float] = field(init=False, default_factory=dict)
+
+    @property
+    def awaiting_snapshot(self) -> bool:
+        return self._awaiting_snapshot
 
     async def run(self):
         # Events and snapshots are handled by one loop so consumers always get a
@@ -131,6 +139,8 @@ class EventRouter:
         # Consumers hold the old session's state, so they must get the new master's state
         # before any of its events: nothing is delivered until its snapshot arrives
         self._awaiting_snapshot = True
+        self.last_delivery_at = None
+        self.node_last_seen.clear()
         self._caught_up()
         if self._tg.is_running():
             self._tg.start_soon(self._request_snapshot, session_id)
@@ -186,7 +196,6 @@ class EventRouter:
                         buf.skip_to(snapshot_idx + 1)
                         await self._deliver(message)
                         drained = buf.drain_indexed()
-                        self._caught_up()
                     case GlobalForwarderEvent():
                         if message.origin != self.session_id.master_node_id:
                             continue
@@ -200,28 +209,28 @@ class EventRouter:
                             continue
 
                         drained = buf.drain_indexed()
-                        if drained:
-                            self._caught_up()
-
-                        if not drained and (
-                            self._nack_cancel_scope is None
-                            or self._nack_cancel_scope.cancel_called
-                        ):
-                            # Request the next index.
-                            self._tg.start_soon(
-                                self._nack_request, buf.next_idx_to_release
-                            )
-                            continue
-
                 for idx, event in drained:
                     await self._deliver(IndexedEvent(idx=idx, event=event))
 
+                # Partial progress can leave a second gap. Keep retrying even if
+                # no further events arrive to reveal that a replay was dropped.
+                missing = buf.next_idx_to_release if buf.store else None
+                if missing != self.missing_event_idx:
+                    self._caught_up()
+                    self.missing_event_idx = missing
+                    if missing is not None:
+                        self._tg.start_soon(self._nack_request, missing)
+
     def _caught_up(self) -> None:
+        self.missing_event_idx = None
         self._nack_attempts = 0
         if self._nack_cancel_scope:
             self._nack_cancel_scope.cancel()
 
     async def _deliver(self, item: IndexedEvent | StateSnapshot) -> None:
+        self.last_delivery_at = anyio.current_time()
+        if isinstance(item, IndexedEvent) and isinstance(item.event, NodeGatheredInfo):
+            self.node_last_seen[item.event.node_id] = self.last_delivery_at
         to_clear = set[int]()
         for i, sender in enumerate(self.internal_outbound):
             try:
@@ -234,8 +243,13 @@ class EventRouter:
     async def _request_snapshot(self, session_id: SessionId) -> None:
         """Ask the new master for its state until it arrives (or the master changes again)."""
         delay = self._nack_base_seconds
+        attempt = 0
         while self._awaiting_snapshot and self.session_id == session_id:
-            logger.info("Asking the new master for a snapshot of its state")
+            attempt += 1
+            if attempt == 1 or attempt % 15 == 0:
+                logger.info(
+                    f"Asking master {session_id} for a state snapshot (attempt {attempt})"
+                )
             await self.command_sender.send(
                 ForwarderCommand(
                     origin=self._system_id,
@@ -249,7 +263,7 @@ class EventRouter:
     async def _nack_request(self, since_idx: int) -> None:
         # We request all events after (and including) the missing index.
         # This function is started whenever we receive an event that is out of sequence.
-        # It is cancelled as soon as we receiver an event that is in sequence.
+        # Retry until this gap closes or the session changes.
 
         if since_idx < 0:
             logger.warning(f"Negative value encountered for nack request {since_idx=}")
@@ -257,20 +271,21 @@ class EventRouter:
 
         with CancelScope() as scope:
             self._nack_cancel_scope = scope
-            delay: float = self._nack_base_seconds * (2.0**self._nack_attempts)
-            delay = min(self._nack_cap_seconds, delay)
-            self._nack_attempts += 1
+            delay = self._nack_base_seconds
             try:
-                await anyio.sleep(delay)
-                logger.info(
-                    f"Nack attempt {self._nack_attempts}: Requesting Event Log from {since_idx}"
-                )
-                await self.command_sender.send(
-                    ForwarderCommand(
-                        origin=self._system_id,
-                        command=RequestEventLog(since_idx=since_idx),
+                while self.missing_event_idx == since_idx:
+                    await anyio.sleep(delay)
+                    self._nack_attempts += 1
+                    logger.debug(
+                        f"Nack attempt {self._nack_attempts}: Requesting Event Log from {since_idx}"
                     )
-                )
+                    await self.command_sender.send(
+                        ForwarderCommand(
+                            origin=self._system_id,
+                            command=RequestEventLog(since_idx=since_idx),
+                        )
+                    )
+                    delay = min(self._nack_cap_seconds, delay * 2)
             finally:
                 if self._nack_cancel_scope is scope:
                     self._nack_cancel_scope = None

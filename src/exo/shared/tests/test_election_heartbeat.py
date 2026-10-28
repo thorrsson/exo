@@ -67,14 +67,14 @@ class Harness:
 
 
 @asynccontextmanager
-async def running_election() -> AsyncIterator[Harness]:
+async def running_election(node_id: NodeId = ME) -> AsyncIterator[Harness]:
     em_out_tx, em_out_rx = channel[ElectionMessage]()
     em_in_tx, em_in_rx = channel[ElectionMessage]()
     er_tx, er_rx = channel[ElectionResult]()
     cm_tx, cm_rx = channel[ConnectionMessage]()
     co_tx, co_rx = channel[ForwarderCommand]()
     election = Election(
-        node_id=ME,
+        node_id=node_id,
         election_message_receiver=em_in_rx,
         election_message_sender=em_out_tx,
         election_result_sender=er_tx,
@@ -204,6 +204,45 @@ async def test_master_heartbeats_keep_the_follower_in_place(
         assert [m for m in h.sent() if not m.heartbeat] == []
 
 
+async def test_election_result_is_not_a_confirmed_master_heartbeat() -> None:
+    async with running_election() as h:
+        master = em(clock=1, seniority=5, node_id="MASTER")
+        await h.follow(master)
+        assert not h.election.master_confirmed
+        await h.inbound.send(master.model_copy(update={"heartbeat": True}))
+        await anyio.sleep(0.02)
+        assert h.election.master_confirmed
+
+
+async def test_old_session_heartbeat_does_not_confirm_current_master() -> None:
+    async with running_election() as h:
+        master = em(clock=2, seniority=5, node_id="MASTER")
+        await h.follow(master)
+        await h.inbound.send(em(clock=1, seniority=1, node_id="OLD", heartbeat=True))
+        await anyio.sleep(0.02)
+        assert not h.election.master_confirmed
+        assert NodeId("OLD") in h.election.conflicting_masters
+        assert h.election.current_session == master.proposed_session
+
+
+async def test_old_session_from_current_master_requires_a_matching_heartbeat() -> None:
+    async with running_election() as h:
+        master = em(clock=2, seniority=5, node_id="MASTER")
+        await h.follow(master)
+        heartbeat = master.model_copy(update={"heartbeat": True})
+        await h.inbound.send(heartbeat)
+        await anyio.sleep(0.02)
+        assert h.election.master_confirmed
+        await h.inbound.send(em(clock=1, seniority=1, node_id="MASTER", heartbeat=True))
+        await anyio.sleep(0.02)
+        assert not h.election.master_confirmed
+        assert NodeId("MASTER") in h.election.conflicting_masters
+        await h.inbound.send(heartbeat)
+        await anyio.sleep(0.02)
+        assert h.election.master_confirmed
+        assert not h.election.conflicting_masters
+
+
 async def test_heartbeat_from_a_master_that_would_lose_is_ignored() -> None:
     async with running_election() as h:
         master = em(clock=1, seniority=5, node_id="MASTER")
@@ -277,6 +316,48 @@ async def test_rounds_a_rival_master_keeps_triggering_back_off(
                         round_started.setdefault(message.clock, anyio.current_time())
 
     assert_backs_off(round_started)
+
+
+async def test_two_masters_converge_when_election_delivery_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("exo.shared.election.MASTER_SILENCE_TIMEOUT", 0.2)
+    monkeypatch.setattr("exo.shared.election.RETRY_MIN_DELAY", 0.1)
+    monkeypatch.setattr("exo.shared.election.RETRY_MAX_DELAY", 0.4)
+    connected = True
+
+    async def forward(source: Harness, target: Harness) -> None:
+        async for message in source.outbound:
+            if connected:
+                await target.inbound.send(message)
+
+    async with (
+        running_election() as local,
+        running_election(NodeId("OLD")) as peer,
+        anyio.create_task_group() as tg,
+    ):
+        tg.start_soon(forward, local, peer)
+        tg.start_soon(forward, peer, local)
+        with anyio.fail_after(2):
+            while local.election.current_session.master_node_id != NodeId("OLD"):
+                await anyio.sleep(0.01)
+        old_session = peer.election.current_session
+        connected = False
+        with anyio.fail_after(2):
+            while local.election.current_session.master_node_id != ME:
+                await anyio.sleep(0.01)
+        assert peer.election.current_session == old_session
+        # The returning peer still advertises its old session. Let the
+        # existing election/backoff protocol reconcile it, without restarts.
+        connected = True
+        with anyio.fail_after(2):
+            while (
+                local.election.current_session != peer.election.current_session
+                or not local.election.master_confirmed
+            ):
+                await anyio.sleep(0.01)
+        assert local.election.current_session == peer.election.current_session
+        tg.cancel_scope.cancel()
 
 
 async def test_rounds_a_silent_master_keeps_triggering_back_off(

@@ -183,3 +183,17 @@ async def test_events_the_old_master_never_acknowledged_are_not_resent() -> None
         harness.router.switch_session(NEW)
 
         assert harness.router.out_for_delivery == {}
+
+
+async def test_switching_session_cancels_old_replay_retries() -> None:
+    async with running_router() as harness:
+        harness.router._nack_base_seconds = 0.02  # pyright: ignore[reportPrivateUsage]
+        await harness.send_events(OLD, 8)
+        assert harness.router.missing_event_idx == 0
+        harness.router.switch_session(NEW)
+        await harness.send_snapshot(NEW, 40)
+        harness.commands.collect()
+        await anyio.sleep(0.15)
+        assert harness.commands.collect() == []
+        assert harness.router.missing_event_idx is None
+        assert harness.router.last_delivery_at is not None

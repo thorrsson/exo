@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 
 import anyio
+import pytest
 
 from exo.routing.event_router import EventRouter
 from exo.shared.types.commands import ForwarderCommand, RequestEventLog
@@ -134,3 +135,55 @@ async def test_snapshot_we_are_already_past_is_ignored() -> None:
 
         await harness.send_events(4)
         assert harness.received() == ["event@4"]
+
+
+async def test_lost_replay_is_retried_without_more_inbound_traffic() -> None:
+    async with running_router() as harness:
+        harness.router._nack_base_seconds = 0.02  # pyright: ignore[reportPrivateUsage]
+        harness.router._nack_cap_seconds = 0.08  # pyright: ignore[reportPrivateUsage]
+        await harness.send_events(2)
+        starts: list[float] = []
+        with anyio.fail_after(1):
+            for _ in range(4):
+                request = await harness.commands.receive()
+                assert isinstance(request.command, RequestEventLog)
+                assert request.command.since_idx == 0
+                starts.append(anyio.current_time())
+        assert starts[2] - starts[1] >= 0.07
+        assert starts[3] - starts[2] >= 0.07
+        assert harness.router.missing_event_idx == 0
+
+        await harness.send_events(0, 1)
+        assert harness.received() == ["event@0", "event@1", "event@2"]
+        assert harness.router.missing_event_idx is None
+        harness.commands.collect()
+        await anyio.sleep(0.15)
+        assert harness.commands.collect() == []
+
+
+async def test_partial_replay_keeps_retrying_the_remaining_gap() -> None:
+    async with running_router() as harness:
+        harness.router._nack_base_seconds = 0.02  # pyright: ignore[reportPrivateUsage]
+        await harness.send_events(2, 4)
+        await harness.send_events(0, 1)
+        assert harness.received() == ["event@0", "event@1", "event@2"]
+        assert harness.router.missing_event_idx == 3
+        with anyio.fail_after(1):
+            while True:
+                request = await harness.commands.receive()
+                assert isinstance(request.command, RequestEventLog)
+                if request.command.since_idx == 3:
+                    break
+        await harness.send_events(3)
+        assert harness.received() == ["event@3", "event@4"]
+        assert harness.router.missing_event_idx is None
+
+
+async def test_duplicate_delivered_events_do_not_request_replay() -> None:
+    async with running_router() as harness:
+        await harness.send_events(0)
+        await harness.send_events(0)
+        with anyio.move_on_after(0.6) as scope:
+            await harness.commands.receive()
+            pytest.fail("A duplicate must not start a replay request")
+        assert scope.cancel_called

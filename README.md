@@ -72,6 +72,29 @@ Devices running exo automatically discover each other, without needing any manua
 
 You can run exo with the macOS app, the easiest way on a Mac, or from source on macOS or Linux.
 
+### Cluster health and recovery
+
+The dashboard distinguishes a lost backend connection from a degraded cluster. Its
+amber banner shows missing peers, master elections, and state synchronization.
+`GET /cluster/health` exposes the same status, session, unavailable node IDs,
+heartbeat/state ages, missing event index, and election retry delay for diagnostics.
+Health warnings are logged at most once every 30 seconds; recovery is logged when
+current-session state and master heartbeats are available again. A returning peer's
+old-session heartbeat alone does not clear a dropout warning.
+
+Timed-out peers remain visible in health reports (including state snapshots) until
+they send current-session node reports. Intentionally removed peers therefore remain
+degraded until the cluster is restarted. Active downloads survive master changes,
+and missing event replays retry with capped exponential backoff without restarting
+workers, deleting models, or rebuilding the network transport. These measures cannot
+repair a network path that remains unavailable. For recurring dropouts, collect
+`/cluster/health` and exo application logs from both peers covering the same interval;
+kernel network logs alone cannot establish the application-level cause.
+Health describes locally observed protocol progress, not an end-to-end network
+test: delayed traffic can look recent, and the heartbeat protocol has no freshness
+challenge. Keep all peers on the same version when using the added snapshot health
+field.
+
 ### macOS App
 
 exo ships a macOS app that runs in the background on your Mac.

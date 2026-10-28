@@ -48,6 +48,8 @@ class State(FrozenModel):
     downloads: Mapping[NodeId, Sequence[DownloadProgress]] = {}
     tasks: Mapping[TaskId, Task] = {}
     last_seen: Mapping[NodeId, datetime] = {}
+    # Keep timed-out peers visible across snapshots until they report in this session.
+    node_timeouts: Mapping[NodeId, datetime] = {}
     topology: Topology = Field(default_factory=Topology)
     last_event_applied_idx: int = Field(default=-1, ge=-1)
 
