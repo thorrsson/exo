@@ -186,9 +186,11 @@ class PipelineLastLayer(CustomMlxLayer):
                 mx.eval(_cache.keys)  # type: ignore
 
         if not self.is_prefill:
-            output = mx.distributed.all_gather(output, group=self.group)[
-                -output.shape[0] :
-            ]
+            gathered = mx.distributed.all_gather(output, group=self.group)
+            # Finish CPU communication before the GPU slice consumes it, so a slow
+            # peer does not leave a Metal command buffer waiting on the collective.
+            mx.eval(gathered)
+            output = gathered[-output.shape[0] :]
             mx.eval(output)
 
         return output

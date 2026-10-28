@@ -57,6 +57,7 @@ from exo.worker.engines.mlx.constants import (
     MAX_TOKENS,
 )
 from exo.worker.engines.mlx.generator.remote_prefill import remote_prefill
+from exo.worker.engines.mlx.generator.warmup import cancellation_check_interval
 from exo.worker.engines.mlx.types import KVCacheType, Model
 from exo.worker.engines.mlx.utils_mlx import (
     apply_chat_template,
@@ -404,7 +405,9 @@ def warmup_inference(
     group: mx.distributed.Group | None,
     model_id: ModelId,
 ) -> int:
-    logger.info(f"warming up inference for instance: {model_id}")
+    rank = group.rank() if group is not None else 0
+    warmup_started = time.monotonic()
+    logger.info(f"[R{rank}] Warmup preparing prompt for instance: {model_id}")
 
     content = InputMessageContent(
         "Prompt to warm up the inference engine. Repeat this."
@@ -424,11 +427,27 @@ def warmup_inference(
 
     tokens_generated = 0
 
+    logger.info(f"[R{rank}] Warmup waiting for initial barrier")
     mx_barrier(group)
 
-    logger.info("Generating warmup tokens")
+    logger.info(
+        f"[R{rank}] Warmup initial barrier complete; starting prefill "
+        "and waiting for first token"
+    )
 
     t = time.monotonic()
+    previous_token_time = t
+    last_prefill_log = t
+
+    def log_prefill_progress(processed: int, total: int) -> None:
+        nonlocal last_prefill_log
+        now = time.monotonic()
+        if processed == total or now - last_prefill_log >= 5.0:
+            logger.info(
+                f"[R{rank}] Warmup prefill progress: {processed}/{total} prompt "
+                f"tokens, elapsed={now - t:.2f}s"
+            )
+            last_prefill_log = now
 
     for _r in mlx_generate(
         model=model,
@@ -437,17 +456,30 @@ def warmup_inference(
         prompt=warmup_prompt,
         kv_prefix_cache=None,
         group=group,
+        on_prefill_progress=log_prefill_progress,
     ):
         tokens_generated += 1
+        now = time.monotonic()
+        phase = "prefill + first token" if tokens_generated == 1 else "decode"
+        logger.info(
+            f"[R{rank}] Warmup {phase}: token "
+            f"{tokens_generated}/{warmup_task_params.max_output_tokens}, "
+            f"step={now - previous_token_time:.2f}s, elapsed={now - t:.2f}s"
+        )
+        previous_token_time = now
 
-    check_for_cancel_every = min(
-        math.ceil(tokens_generated / min(time.monotonic() - t, 0.001)), 100
+    elapsed = time.monotonic() - t
+    check_for_cancel_every = cancellation_check_interval(tokens_generated, elapsed)
+
+    logger.info(
+        f"[R{rank}] Warmup generation complete: {tokens_generated} tokens "
+        f"in {elapsed:.2f}s; waiting for final barrier"
     )
-
     mx_barrier(group)
 
-    logger.info(f"warmed up by generating {tokens_generated} tokens")
+    logger.info(f"[R{rank}] Warmup final barrier complete")
     if group is not None:
+        logger.info(f"[R{rank}] Warmup synchronizing cancellation check interval")
         check_for_cancel_every = int(
             mx.max(
                 mx.distributed.all_gather(
@@ -458,6 +490,7 @@ def warmup_inference(
         )
 
     logger.info(
+        f"[R{rank}] Warmup complete in {time.monotonic() - warmup_started:.2f}s; "
         f"runner checking for cancellation every {check_for_cancel_every} tokens"
     )
 
